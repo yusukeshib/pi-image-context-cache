@@ -4,7 +4,14 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import imageContextCacheExtension, { cacheImage, cacheStats, hashImage, pruneImageContext } from "./index.ts";
+import imageContextCacheExtension, {
+  cacheImage,
+  cacheStats,
+  hashImage,
+  isCacheHitEntryData,
+  pruneImageContext,
+  readCachedPreview,
+} from "./index.ts";
 
 const tempDirs: string[] = [];
 
@@ -18,6 +25,14 @@ function image(text = "pixel"): ImageContent {
   return {
     type: "image",
     data: Buffer.from(text).toString("base64"),
+    mimeType: "image/png",
+  };
+}
+
+function pngImage(): ImageContent {
+  return {
+    type: "image",
+    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
     mimeType: "image/png",
   };
 }
@@ -240,11 +255,52 @@ describe("image cache", () => {
     expect(lstatSync(dir).mode & 0o077).toBe(0);
   });
 
-  test("registers Pi hooks that cache tool images and prune later context", async () => {
+  test("reads a verified cached preview through a no-follow descriptor", () => {
+    const dir = tempDir();
+    const value = pngImage();
+    const record = cacheImage(value, dir);
+    const data = { ...record, timestamp: Date.now() };
+
+    expect(readCachedPreview(data, dir)).toBe(value.data);
+  });
+
+  test("rejects symlinked and hash-mismatched expanded previews", () => {
+    const dir = tempDir();
+    const outside = tempDir();
+    const value = pngImage();
+    const record = cacheImage(value, dir);
+    const data = { ...record, timestamp: Date.now() };
+    const outsideFile = path.join(outside, "outside.png");
+    writeFileSync(outsideFile, Buffer.from(value.data, "base64"), { mode: 0o600 });
+    rmSync(record.path, { force: true });
+    symlinkSync(outsideFile, record.path);
+    expect(readCachedPreview(data, dir)).toBeUndefined();
+
+    rmSync(record.path, { force: true });
+    writeFileSync(record.path, Buffer.alloc(record.bytes, 0x58), { mode: 0o600 });
+    expect(readCachedPreview(data, dir)).toBeUndefined();
+  });
+
+  test("rejects malformed persisted cache-card data", () => {
+    expect(isCacheHitEntryData({ sha256: 3, path: null })).toBe(false);
+    expect(
+      isCacheHitEntryData({
+        sha256: "a".repeat(64),
+        path: "/tmp/a.png",
+        mimeType: "text/plain",
+        bytes: -1,
+        timestamp: Number.NaN,
+      }),
+    ).toBe(false);
+  });
+
+  test("registers Pi hooks, appends one TUI-only cache card, and deduplicates it", async () => {
     const dir = tempDir();
     process.env.PI_IMAGE_CONTEXT_CACHE_DIR = dir;
     const handlers = new Map<string, (event: any, ctx?: any) => Promise<any>>();
     const commands = new Map<string, any>();
+    const renderers = new Map<string, (entry: any, options: any, theme: any) => any>();
+    const entries: Array<{ customType: string; data: any }> = [];
     imageContextCacheExtension({
       on(name: string, handler: (event: any, ctx?: any) => Promise<any>) {
         handlers.set(name, handler);
@@ -252,25 +308,102 @@ describe("image cache", () => {
       registerCommand(name: string, command: any) {
         commands.set(name, command);
       },
+      registerEntryRenderer(name: string, renderer: (entry: any, options: any, theme: any) => any) {
+        renderers.set(name, renderer);
+      },
+      appendEntry(customType: string, data: any) {
+        entries.push({ customType, data });
+      },
     } as any);
 
-    const value = image();
+    await handlers.get("session_start")?.({}, {
+      hasUI: true,
+      sessionManager: { getEntries: () => [] },
+      ui: { notify() {} },
+    });
+    const value = pngImage();
     await handlers.get("tool_result")?.({
       toolName: "read",
       toolCallId: "call-1",
       input: { path: "/tmp/input.png" },
       content: [value],
     });
-    const transformed = await handlers.get("context")?.({
+    const contextEvent = {
       messages: messages(
         assistant([{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "/tmp/input.png" } }]),
         toolResult("call-1", [value]),
         assistant(),
       ),
-    });
+    };
+    const transformed = await handlers.get("context")?.(contextEvent);
 
     expect(cacheStats(dir).images).toBe(1);
     expect((transformed.messages[1] as any).content[0].text).toContain("Original source: /tmp/input.png");
+    expect(entries).toHaveLength(0);
+    await handlers.get("turn_end")?.({});
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.data.sha256).toBe(hashImage(value));
+    expect(JSON.stringify(entries[0]!.data)).not.toContain(value.data);
+
+    await handlers.get("context")?.(contextEvent);
+    await handlers.get("turn_end")?.({});
+    expect(entries).toHaveLength(1);
     expect(commands.has("image-cache")).toBe(true);
+
+    const renderer = renderers.get(entries[0]!.customType)!;
+    const component = renderer(
+      { data: entries[0]!.data },
+      { expanded: false },
+      { fg: (_name: string, text: string) => text, bg: (_name: string, text: string) => text },
+    );
+    expect(component.render(120).join("\n")).toContain("Image context cached");
+
+    const expandedPreview = renderer(
+      { data: entries[0]!.data },
+      { expanded: true },
+      { fg: (_name: string, text: string) => text, bg: (_name: string, text: string) => text },
+    );
+    const expandedText = expandedPreview.render(120).join("\n");
+    expect(expandedText).not.toContain("Cached preview is unavailable");
+    expect(expandedText).not.toContain("Cached preview could not be rendered");
+
+    rmSync(entries[0]!.data.path, { force: true });
+    const missingPreview = renderer(
+      { data: entries[0]!.data },
+      { expanded: true },
+      { fg: (_name: string, text: string) => text, bg: (_name: string, text: string) => text },
+    );
+    expect(missingPreview.render(120).join("\n")).toContain("Cached preview is unavailable");
+  });
+
+  test("restores rendered SHA deduplication from persisted custom entries", async () => {
+    const dir = tempDir();
+    process.env.PI_IMAGE_CONTEXT_CACHE_DIR = dir;
+    const handlers = new Map<string, (event: any, ctx?: any) => Promise<any>>();
+    const appended: any[] = [];
+    const value = image();
+    const record = cacheImage(value, dir);
+    imageContextCacheExtension({
+      on(name: string, handler: (event: any, ctx?: any) => Promise<any>) {
+        handlers.set(name, handler);
+      },
+      registerCommand() {},
+      registerEntryRenderer() {},
+      appendEntry(_type: string, data: any) {
+        appended.push(data);
+      },
+    } as any);
+
+    await handlers.get("session_start")?.({}, {
+      hasUI: true,
+      sessionManager: {
+        getEntries: () => [{ type: "custom", customType: "pi-image-context-cache-hit", data: { ...record, timestamp: 1 } }],
+      },
+      ui: { notify() {} },
+    });
+    await handlers.get("context")?.({ messages: messages(user([value]), assistant()) });
+    await handlers.get("turn_end")?.({});
+
+    expect(appended).toHaveLength(0);
   });
 });

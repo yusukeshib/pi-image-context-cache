@@ -25,10 +25,12 @@ pi install git:github.com/yusukeshib/pi-image-context-cache
 1. Image blocks from prompt attachments, custom messages, and tool results are SHA-256 hashed and cached under `~/.cache/pi-image-context/`.
 2. A new image remains in context until the model has had one assistant turn to inspect it.
 3. Subsequent provider requests receive a text placeholder containing the cache path, original read path when known, MIME type, size, and hash.
-4. Re-reading the cached file makes the image fresh for another turn.
-5. Images are only evicted after a cache copy succeeds.
+4. The main chat transcript receives one TUI-only cache card per image SHA. The card does not enter LLM context.
+5. Expand the card to preview the cached image directly in supported terminals.
+6. Re-reading the cached file makes the image fresh for another turn.
+7. Images are only evicted after a cache copy succeeds.
 
-The cache uses directory mode `0700` and file mode `0600`. Images older than 30 days are removed at session start.
+The cache uses directory mode `0700` and file mode `0600`. Images older than 30 days are removed at session start. Cache cards persist only the path, hash, MIME type, size, source path, and timestamp—never image base64.
 
 ## Commands
 

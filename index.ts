@@ -1,13 +1,18 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Image as TuiImage, Text } from "@earendil-works/pi-tui";
 import { createHash, randomBytes } from "node:crypto";
 import type { Stats } from "node:fs";
 import {
   chmodSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -21,8 +26,9 @@ import path from "node:path";
 const DEFAULT_CACHE_DIR = path.join(os.homedir(), ".cache", "pi-image-context");
 const DEFAULT_TTL_TURNS = 1;
 const DEFAULT_MAX_AGE_DAYS = 30;
+const CACHE_HIT_ENTRY_TYPE = "pi-image-context-cache-hit";
 
-interface CacheRecord {
+export interface CacheRecord {
   sha256: string;
   path: string;
   mimeType: string;
@@ -50,6 +56,10 @@ interface CacheStats {
   images: number;
   bytes: number;
   metadataFiles: number;
+}
+
+export interface CacheHitEntryData extends CacheRecord {
+  timestamp: number;
 }
 
 type MessageWithContent = {
@@ -256,6 +266,7 @@ function placeholder(record: CacheRecord, ttlTurns: number): TextContent {
 export function pruneImageContext(
   messages: AgentMessage[],
   options: Pick<ImageCacheOptions, "cacheDir" | "ttlTurns">,
+  onEvict?: (record: CacheRecord) => void,
 ): AgentMessage[] {
   const sources = toolCallSources(messages);
   const ttlTurns = Math.max(1, options.ttlTurns);
@@ -282,6 +293,7 @@ export function pruneImageContext(
         const record = cacheImage(block, options.cacheDir, source);
         if (!shouldEvict) return block;
         changed = true;
+        onEvict?.(record);
         return placeholder(record, ttlTurns);
       } catch {
         // Never remove an image unless a recoverable cache copy exists.
@@ -346,12 +358,100 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
+export function isCacheHitEntryData(value: unknown): value is CacheHitEntryData {
+  if (!value || typeof value !== "object") return false;
+  const data = value as Partial<CacheHitEntryData>;
+  return (
+    typeof data.sha256 === "string" &&
+    /^[a-f0-9]{64}$/.test(data.sha256) &&
+    typeof data.path === "string" &&
+    path.isAbsolute(data.path) &&
+    typeof data.mimeType === "string" &&
+    /^image\/[a-z0-9.+-]+$/i.test(data.mimeType) &&
+    typeof data.bytes === "number" &&
+    Number.isSafeInteger(data.bytes) &&
+    data.bytes >= 0 &&
+    typeof data.timestamp === "number" &&
+    Number.isFinite(data.timestamp) &&
+    (data.source === undefined || typeof data.source === "string")
+  );
+}
+
+export function readCachedPreview(data: CacheHitEntryData, cacheDir: string): string | undefined {
+  const expectedPath = path.join(cacheDir, `${data.sha256}.${imageExtension(data.mimeType)}`);
+  if (path.resolve(data.path) !== expectedPath || typeof fsConstants.O_NOFOLLOW !== "number") return undefined;
+
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(expectedPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stat = fstatSync(descriptor);
+    if (!stat.isFile()) return undefined;
+    const getuid = process.getuid;
+    if (typeof getuid === "function" && stat.uid !== getuid()) return undefined;
+    if ((stat.mode & 0o077) !== 0 || stat.size !== data.bytes) return undefined;
+    const bytes = readFileSync(descriptor);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    return sha256 === data.sha256 ? bytes.toString("base64") : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
 export default function imageContextCacheExtension(pi: ExtensionAPI) {
   const options = loadOptions();
+  const displayedHashes = new Set<string>();
+  const pendingEntries = new Map<string, CacheHitEntryData>();
+
+  pi.registerEntryRenderer<CacheHitEntryData>(CACHE_HIT_ENTRY_TYPE, (entry, { expanded }, theme) => {
+    const data = entry.data;
+    const box = new Box(1, 0, (text) => theme.bg("customMessageBg", text));
+    if (!isCacheHitEntryData(data)) {
+      box.addChild(new Text(theme.fg("warning", "♻ Image context cache entry has invalid data"), 0, 0));
+      return box;
+    }
+
+    box.addChild(
+      new Text(
+        `${theme.fg("success", "♻")} ${theme.fg("accent", "Image context cached")} ${theme.fg("muted", `· ${formatBytes(data.bytes)} evicted`)}`,
+        0,
+        0,
+      ),
+    );
+    if (!expanded) return box;
+
+    box.addChild(new Text(theme.fg("dim", `${data.sha256.slice(0, 12)}… · ${data.path}`), 0, 0));
+    if (data.source) box.addChild(new Text(theme.fg("dim", `source: ${data.source}`), 0, 0));
+    const imageData = readCachedPreview(data, options.cacheDir);
+    if (!imageData) {
+      box.addChild(new Text(theme.fg("warning", "Cached preview is unavailable."), 0, 0));
+      return box;
+    }
+    try {
+      box.addChild(
+        new TuiImage(
+          imageData,
+          data.mimeType,
+          { fallbackColor: (text) => theme.fg("muted", text) },
+          { maxWidthCells: 72, maxHeightCells: 20, filename: path.basename(data.path) },
+        ),
+      );
+    } catch {
+      box.addChild(new Text(theme.fg("warning", "Cached preview could not be rendered."), 0, 0));
+    }
+    return box;
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     sourceByToolCall.clear();
     recordByHash.clear();
+    displayedHashes.clear();
+    pendingEntries.clear();
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (entry.type !== "custom" || entry.customType !== CACHE_HIT_ENTRY_TYPE) continue;
+      if (isCacheHitEntryData(entry.data)) displayedHashes.add(entry.data.sha256);
+    }
     const removed = removeExpired(options.cacheDir, options.maxAgeDays);
     if (removed > 0 && ctx.hasUI) {
       ctx.ui.notify(`Image context cache: removed ${removed} expired image(s).`, "info");
@@ -373,8 +473,20 @@ export default function imageContextCacheExtension(pi: ExtensionAPI) {
   });
 
   pi.on("context", async (event) => ({
-    messages: pruneImageContext(event.messages, options),
+    messages: pruneImageContext(event.messages, options, (record) => {
+      if (displayedHashes.has(record.sha256) || pendingEntries.has(record.sha256)) return;
+      pendingEntries.set(record.sha256, { ...record, timestamp: Date.now() });
+    }),
   }));
+
+  pi.on("turn_end", async () => {
+    for (const [sha256, data] of pendingEntries) {
+      if (displayedHashes.has(sha256)) continue;
+      pi.appendEntry<CacheHitEntryData>(CACHE_HIT_ENTRY_TYPE, data);
+      displayedHashes.add(sha256);
+    }
+    pendingEntries.clear();
+  });
 
   pi.registerCommand("image-cache", {
     description: "Show or clear the pi image context cache: /image-cache [stats|clear]",
@@ -394,6 +506,7 @@ export default function imageContextCacheExtension(pi: ExtensionAPI) {
         rmSync(options.cacheDir, { recursive: true, force: true });
         recordByHash.clear();
         sourceByToolCall.clear();
+        pendingEntries.clear();
         ctx.ui.notify("Image context cache cleared.", "info");
         return;
       }
