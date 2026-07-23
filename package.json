@@ -1,0 +1,48 @@
+{
+  "name": "@yusukeshib/pi-image-context-cache",
+  "version": "0.1.0",
+  "description": "Cache images from pi sessions and evict stale image payloads from repeated LLM context.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "image-cache",
+    "context"
+  ],
+  "license": "MIT",
+  "author": "Yusuke Shibata <yusukeshib@gmail.com>",
+  "homepage": "https://github.com/yusukeshib/pi-image-context-cache#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yusukeshib/pi-image-context-cache.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yusukeshib/pi-image-context-cache/issues"
+  },
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run check",
+    "release": "npm publish --access public"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3"
+  }
+}
