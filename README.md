@@ -1,12 +1,15 @@
 # pi-image-context-cache
 
-A [pi](https://github.com/earendil-works/pi) extension that caches image results locally and removes stale base64 image payloads from repeated LLM requests.
-
-Images remain visible for their first model turn. On later turns, the extension replaces each image in the outgoing context with a compact cache reference. The persisted pi session is not rewritten.
+A [pi](https://github.com/earendil-works/pi) extension that keeps image payloads out of the main agent context by default, caches image bytes locally, and delegates visual analysis to an isolated Vision request.
 
 ## Why
 
-Image tool results can be several megabytes. Without eviction, the same image is sent again on every later model request, increasing cache-read cost and context pressure. This extension keeps the first visual inspection intact while making later requests text-only.
+Image tool results can be several megabytes. Sending the same image through the main conversation increases provider cost, session size, and context pressure. This extension uses a hybrid model:
+
+- Normal image attachments and reads are analyzed in an isolated Vision request.
+- The main model receives only a detailed text result.
+- Vision results are cached by image SHA-256, question, prompt version, and model.
+- Reading the generated cache path explicitly bypasses isolation when the main model genuinely needs direct pixel access.
 
 ## Install
 
@@ -14,7 +17,7 @@ Image tool results can be several megabytes. Without eviction, the same image is
 pi install npm:@yusukeshib/pi-image-context-cache
 ```
 
-Or install directly from GitHub while developing:
+Or install directly from GitHub:
 
 ```sh
 pi install git:github.com/yusukeshib/pi-image-context-cache
@@ -22,45 +25,64 @@ pi install git:github.com/yusukeshib/pi-image-context-cache
 
 ## Behavior
 
-1. Image blocks from prompt attachments, custom messages, and tool results are SHA-256 hashed and cached under `~/.cache/pi-image-context/`.
-2. A new image remains in context until the model has had one successful assistant turn to inspect it.
-3. Re-reading the same image from its original path returns a compact cache-hit result without an image block, so duplicate base64 is neither persisted nor sent to the model.
-4. Subsequent provider requests replace older image payloads with a text reference containing the cache path, original read path when known, MIME type, size, and hash.
-5. The main chat transcript receives a TUI-only card on every cache-hit event. Cards do not enter LLM context; duplicate cards are suppressed only within the same tool call/provider attempt.
-6. Expand the card to preview the cached image directly in supported terminals.
-7. To force visual re-inspection, read the generated cache path directly; that explicit cache-path read is allowed through for one turn.
-8. A changed file at the same source path receives a new content hash and is treated as a new image.
-9. Images are only removed after a verified cache copy succeeds.
-
-The cache uses directory mode `0700` and file mode `0600`. Images older than 30 days are removed at session start. Cache cards persist only the path, hash, MIME type, size, source path, and timestamp—never image base64.
+1. Supported image blocks are strictly validated, SHA-256 hashed, and stored under `~/.cache/pi-image-context/`.
+2. Prompt attachments are removed before the main agent starts and replaced with isolated Vision analysis.
+3. Images returned by the built-in `read` tool are replaced before the tool result is persisted or sent to the main model.
+4. Vision analysis is cached by `image SHA + user question + model + prompt version`; identical concurrent requests share one provider call.
+5. A different question about the same image triggers a new isolated analysis.
+6. Vision failure is fail-closed: the image is not silently sent to the main model. The result explains how to opt into direct inspection.
+7. Reading the absolute generated cache path is an explicit bypass and sends that image to the main model for one turn.
+8. In `direct` mode, the first image reaches the main model and later duplicate payloads are replaced with compact cache references.
+9. Every successful cache-hit/Vision event can add a TUI-only transcript card. Cards never enter LLM context and never store base64.
+10. Branch navigation and compaction rebuild seen-image state from the effective active branch.
 
 ## Commands
 
 ```text
 /image-cache          # show cache statistics
 /image-cache stats    # same
-/image-cache clear    # clear after confirmation
+/image-cache clear    # safely remove only recognized cache artifacts
 ```
+
+`clear` never recursively removes the configured directory and preserves unrelated files.
 
 ## Configuration
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `PI_IMAGE_CONTEXT_CACHE_DIR` | `~/.cache/pi-image-context` | Cache directory |
-| `PI_IMAGE_CONTEXT_CACHE_TTL_TURNS` | `1` | Number of successful later assistant messages before eviction; values below `1` are clamped to `1` |
-| `PI_IMAGE_CONTEXT_CACHE_MAX_AGE_DAYS` | `30` | Remove older cache entries at startup; `0` disables expiry |
+| `PI_IMAGE_CONTEXT_CACHE_DIR` | `~/.cache/pi-image-context` | Private cache directory |
+| `PI_IMAGE_CONTEXT_CACHE_VISION_MODE` | `isolated` | `isolated` or `direct` |
+| `PI_IMAGE_CONTEXT_CACHE_VISION_MODEL` | current model | Optional `provider/model` used for isolated analysis |
+| `PI_IMAGE_CONTEXT_CACHE_VISION_MAX_TOKENS` | `2048` | Maximum isolated Vision output tokens |
+| `PI_IMAGE_CONTEXT_CACHE_TTL_TURNS` | `1` | Successful assistant turns before old direct-mode payloads are evicted; minimum `1` |
+| `PI_IMAGE_CONTEXT_CACHE_MAX_IMAGE_BYTES` | `52428800` | Hard per-image decoded-byte limit |
+| `PI_IMAGE_CONTEXT_CACHE_MAX_BYTES` | `1073741824` | Total cached-image quota with oldest-access eviction |
+| `PI_IMAGE_CONTEXT_CACHE_MAX_AGE_DAYS` | `30` | Cache/analysis expiry; `0` disables age expiry |
+
+## Security and privacy
+
+- Cache directories use mode `0700`; files use `0600` on supported Unix platforms.
+- Cache files are opened with `O_NOFOLLOW`, validated by descriptor, and verified by size and SHA before use.
+- MIME types are allowlisted and checked against image signatures.
+- Writes use private temporary files and atomic publication.
+- A sentinel and dangerous-path checks protect cache maintenance and clear operations.
+- Source paths are control-character sanitized, length-limited, and the home prefix is redacted in metadata.
+- Isolated Vision still sends the image to the selected Vision provider. It isolates the image from the **main conversation**, not from the provider itself.
+- Isolated Vision calls have their own provider cost. The extension includes that cost in the generated text when the provider reports it, but it is not part of the main assistant turn’s usage accounting.
+- Platforms without `O_NOFOLLOW` fail closed for caching/preview rather than claiming equivalent filesystem guarantees.
 
 ## Scope and limitations
 
-- The extension changes only the context sent to the model; it does not rewrite existing session JSONL files.
-- “Seen” is inferred from a later non-error/non-aborted assistant message. This is branch-safe and retry-safe for normal Pi flows, but another extension loaded later could still remove an image before the provider request.
-- The first version preserves the original image bytes. It does not resize or recompress images.
-- Source paths are recorded only for the built-in `read` tool. Other image-producing tools still receive a cache path.
-- Duplicate suppression is content-based, never path-based: changing image bytes at the same path bypasses the old cache entry.
-- Cache files may contain sensitive screenshots. They remain local and private, but should still be handled as sensitive data.
+- Existing historical session JSONL files are not rewritten. New isolated `read` results do not persist image base64.
+- Prompt attachments are transformed before agent processing, so their image payloads are not added to the main user message in isolated mode.
+- The cache preserves original compressed bytes; it does not resize or recompress images.
+- Signature checks reject obvious MIME mismatches but are not a full hardened image decoder.
+- The explicit cache-path bypass trades cost for maximum task-specific visual accuracy.
 
 ## Development
 
 ```sh
-bun test
+npm install
+npm run check
+npm pack --dry-run
 ```
