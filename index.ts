@@ -60,6 +60,7 @@ interface CacheStats {
 
 export interface CacheHitEntryData extends CacheRecord {
   timestamp: number;
+  hitId?: string;
 }
 
 type MessageWithContent = {
@@ -279,7 +280,7 @@ function cacheHitPlaceholder(record: CacheRecord): TextContent {
 interface ImageContextDeduplication {
   seenHashes: ReadonlySet<string>;
   onFreshImage?: (record: CacheRecord) => void;
-  onCacheHit?: (record: CacheRecord) => void;
+  onCacheHit?: (record: CacheRecord, eventId: string) => void;
 }
 
 function isExplicitCacheRead(source: string | undefined, record: CacheRecord): boolean {
@@ -311,6 +312,10 @@ export function pruneImageContext(
     if (!Array.isArray(candidate.content) || !candidate.content.some(isImageContent)) return message;
 
     const source = candidate.toolCallId ? sources.get(candidate.toolCallId) : undefined;
+    const messageTimestamp = typeof (message as { timestamp?: unknown }).timestamp === "number"
+      ? String((message as { timestamp: number }).timestamp)
+      : "untimed";
+    const eventId = candidate.toolCallId || `${message.role}:${messageTimestamp}:${index}`;
     const shouldEvict = assistantTurnsAfter[index]! >= ttlTurns;
     let changed = false;
     const content = candidate.content.map((block) => {
@@ -322,7 +327,7 @@ export function pruneImageContext(
           const cacheHit = Boolean(deduplication?.seenHashes.has(record.sha256) || alreadyOffered);
           if (cacheHit && !isExplicitCacheRead(source, record)) {
             changed = true;
-            deduplication?.onCacheHit?.(record);
+            deduplication?.onCacheHit?.(record, eventId);
             return cacheHitPlaceholder(record);
           }
           offeredThisRequest.add(record.sha256);
@@ -410,7 +415,8 @@ export function isCacheHitEntryData(value: unknown): value is CacheHitEntryData 
     data.bytes >= 0 &&
     typeof data.timestamp === "number" &&
     Number.isFinite(data.timestamp) &&
-    (data.source === undefined || typeof data.source === "string")
+    (data.source === undefined || typeof data.source === "string") &&
+    (data.hitId === undefined || typeof data.hitId === "string")
   );
 }
 
@@ -438,13 +444,12 @@ export function readCachedPreview(data: CacheHitEntryData, cacheDir: string): st
 
 export default function imageContextCacheExtension(pi: ExtensionAPI) {
   const options = loadOptions();
-  const displayedHashes = new Set<string>();
   const seenHashes = new Set<string>();
   const pendingSeenHashes = new Set<string>();
   const pendingEntries = new Map<string, CacheHitEntryData>();
-  const queueCacheCard = (record: CacheRecord) => {
-    if (displayedHashes.has(record.sha256) || pendingEntries.has(record.sha256)) return;
-    pendingEntries.set(record.sha256, { ...record, timestamp: Date.now() });
+  const queueCacheCard = (record: CacheRecord, hitId: string) => {
+    if (pendingEntries.has(hitId)) return;
+    pendingEntries.set(hitId, { ...record, timestamp: Date.now(), hitId });
   };
 
   pi.registerEntryRenderer<CacheHitEntryData>(CACHE_HIT_ENTRY_TYPE, (entry, { expanded }, theme) => {
@@ -457,7 +462,7 @@ export default function imageContextCacheExtension(pi: ExtensionAPI) {
 
     box.addChild(
       new Text(
-        `${theme.fg("success", "♻")} ${theme.fg("accent", "Image context cached")} ${theme.fg("muted", `· ${formatBytes(data.bytes)} evicted`)}`,
+        `${theme.fg("success", "♻")} ${theme.fg("accent", "Image cache hit")} ${theme.fg("muted", `· ${formatBytes(data.bytes)} not resent`)}`,
         0,
         0,
       ),
@@ -489,14 +494,12 @@ export default function imageContextCacheExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     sourceByToolCall.clear();
     recordByHash.clear();
-    displayedHashes.clear();
     seenHashes.clear();
     pendingSeenHashes.clear();
     pendingEntries.clear();
     for (const entry of ctx.sessionManager.getEntries()) {
       if (entry.type !== "custom" || entry.customType !== CACHE_HIT_ENTRY_TYPE) continue;
       if (!isCacheHitEntryData(entry.data)) continue;
-      displayedHashes.add(entry.data.sha256);
       seenHashes.add(entry.data.sha256);
     }
 
@@ -541,7 +544,7 @@ export default function imageContextCacheExtension(pi: ExtensionAPI) {
         const cacheHit = seenHashes.has(record.sha256) || offeredInResult.has(record.sha256);
         if (cacheHit && !isExplicitCacheRead(source, record)) {
           changed = true;
-          queueCacheCard(record);
+          queueCacheCard(record, `tool:${event.toolCallId}:${record.sha256}`);
           return cacheHitPlaceholder(record);
         }
         offeredInResult.add(record.sha256);
@@ -555,10 +558,10 @@ export default function imageContextCacheExtension(pi: ExtensionAPI) {
   });
 
   pi.on("context", async (event) => ({
-    messages: pruneImageContext(event.messages, options, queueCacheCard, {
+    messages: pruneImageContext(event.messages, options, undefined, {
       seenHashes,
       onFreshImage: (record) => pendingSeenHashes.add(record.sha256),
-      onCacheHit: queueCacheCard,
+      onCacheHit: (record, eventId) => queueCacheCard(record, `context:${eventId}:${record.sha256}`),
     }),
   }));
 
@@ -571,10 +574,8 @@ export default function imageContextCacheExtension(pi: ExtensionAPI) {
       for (const sha256 of pendingSeenHashes) seenHashes.add(sha256);
     }
     pendingSeenHashes.clear();
-    for (const [sha256, data] of pendingEntries) {
-      if (displayedHashes.has(sha256)) continue;
+    for (const data of pendingEntries.values()) {
       pi.appendEntry<CacheHitEntryData>(CACHE_HIT_ENTRY_TYPE, data);
-      displayedHashes.add(sha256);
     }
     pendingEntries.clear();
   });

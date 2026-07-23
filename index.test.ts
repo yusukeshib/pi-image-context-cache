@@ -402,7 +402,7 @@ describe("image cache", () => {
       { expanded: false },
       { fg: (_name: string, text: string) => text, bg: (_name: string, text: string) => text },
     );
-    expect(component.render(120).join("\n")).toContain("Image context cached");
+    expect(component.render(120).join("\n")).toContain("Image cache hit");
 
     const expandedPreview = renderer(
       { data: entries[0]!.data },
@@ -412,6 +412,17 @@ describe("image cache", () => {
     const expandedText = expandedPreview.render(120).join("\n");
     expect(expandedText).not.toContain("Cached preview is unavailable");
     expect(expandedText).not.toContain("Cached preview could not be rendered");
+
+    const nextDuplicate = await handlers.get("tool_result")?.({
+      toolName: "read",
+      toolCallId: "call-6",
+      input: { path: "/tmp/input.png" },
+      content: [value],
+    });
+    expect(nextDuplicate.content[0].text).toContain("Image cache hit");
+    await handlers.get("turn_end")?.({ message: assistant() });
+    expect(entries).toHaveLength(2);
+    expect(entries[0]!.data.hitId).not.toBe(entries[1]!.data.hitId);
 
     rmSync(entries[0]!.data.path, { force: true });
     const missingPreview = renderer(
@@ -458,7 +469,7 @@ describe("image cache", () => {
     expect(duplicate.content[0].text).toContain("Image cache hit");
   });
 
-  test("restores rendered SHA deduplication from persisted custom entries", async () => {
+  test("emits per-event cards while suppressing duplicate callbacks and retries", async () => {
     const dir = tempDir();
     process.env.PI_IMAGE_CONTEXT_CACHE_DIR = dir;
     const handlers = new Map<string, (event: any, ctx?: any) => Promise<any>>();
@@ -484,15 +495,24 @@ describe("image cache", () => {
       },
       ui: { notify() {} },
     });
-    const duplicate = await handlers.get("tool_result")?.({
+    const repeatedToolEvent = {
       toolName: "read",
       toolCallId: "call-restored",
       input: { path: "/tmp/input.png" },
       content: [value],
-    });
+    };
+    const duplicate = await handlers.get("tool_result")?.(repeatedToolEvent);
+    await handlers.get("tool_result")?.(repeatedToolEvent);
+
+    const repeatedContextEvent = { messages: messages({ ...user([value]), timestamp: 10 }) };
+    await handlers.get("context")?.(repeatedContextEvent);
+    await handlers.get("context")?.(repeatedContextEvent);
+    await handlers.get("context")?.({ messages: messages({ ...user([value]), timestamp: 11 }) });
     await handlers.get("turn_end")?.({ message: assistant() });
 
     expect(duplicate.content[0].text).toContain("Image cache hit");
-    expect(appended).toHaveLength(0);
+    expect(appended).toHaveLength(3);
+    expect(new Set(appended.map((entry) => entry.hitId)).size).toBe(3);
+    expect(appended.some((entry) => entry.hitId.includes("call-restored"))).toBe(true);
   });
 });
