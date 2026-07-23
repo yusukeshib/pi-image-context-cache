@@ -23,12 +23,14 @@ pi install git:github.com/yusukeshib/pi-image-context-cache
 ## Behavior
 
 1. Image blocks from prompt attachments, custom messages, and tool results are SHA-256 hashed and cached under `~/.cache/pi-image-context/`.
-2. A new image remains in context until the model has had one assistant turn to inspect it.
-3. Subsequent provider requests receive a text placeholder containing the cache path, original read path when known, MIME type, size, and hash.
-4. The main chat transcript receives one TUI-only cache card per image SHA. The card does not enter LLM context.
-5. Expand the card to preview the cached image directly in supported terminals.
-6. Re-reading the cached file makes the image fresh for another turn.
-7. Images are only evicted after a cache copy succeeds.
+2. A new image remains in context until the model has had one successful assistant turn to inspect it.
+3. Re-reading the same image from its original path returns a compact cache-hit result without an image block, so duplicate base64 is neither persisted nor sent to the model.
+4. Subsequent provider requests replace older image payloads with a text reference containing the cache path, original read path when known, MIME type, size, and hash.
+5. The main chat transcript receives one TUI-only cache card per image SHA. The card does not enter LLM context.
+6. Expand the card to preview the cached image directly in supported terminals.
+7. To force visual re-inspection, read the generated cache path directly; that explicit cache-path read is allowed through for one turn.
+8. A changed file at the same source path receives a new content hash and is treated as a new image.
+9. Images are only removed after a verified cache copy succeeds.
 
 The cache uses directory mode `0700` and file mode `0600`. Images older than 30 days are removed at session start. Cache cards persist only the path, hash, MIME type, size, source path, and timestamp—never image base64.
 
@@ -54,6 +56,7 @@ The cache uses directory mode `0700` and file mode `0600`. Images older than 30 
 - “Seen” is inferred from a later non-error/non-aborted assistant message. This is branch-safe and retry-safe for normal Pi flows, but another extension loaded later could still remove an image before the provider request.
 - The first version preserves the original image bytes. It does not resize or recompress images.
 - Source paths are recorded only for the built-in `read` tool. Other image-producing tools still receive a cache path.
+- Duplicate suppression is content-based, never path-based: changing image bytes at the same path bypasses the old cache entry.
 - Cache files may contain sensitive screenshots. They remain local and private, but should still be handled as sensitive data.
 
 ## Development

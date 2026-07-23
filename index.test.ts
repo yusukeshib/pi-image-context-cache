@@ -198,6 +198,20 @@ describe("image cache", () => {
     expect(cacheStats(dir).images).toBe(1);
   });
 
+  test("deduplicates a fresh prompt attachment after its SHA was seen", () => {
+    const dir = tempDir();
+    const value = image();
+    const result = pruneImageContext(
+      messages(user([value])),
+      { cacheDir: dir, ttlTurns: 1 },
+      undefined,
+      { seenHashes: new Set([hashImage(value)]) },
+    );
+
+    expect((result[0] as any).content[0].type).toBe("text");
+    expect((result[0] as any).content[0].text).toContain("Image cache hit");
+  });
+
   test("keeps a fresh tool-result image until a successful assistant response", () => {
     const dir = tempDir();
     const value = image();
@@ -318,36 +332,68 @@ describe("image cache", () => {
 
     await handlers.get("session_start")?.({}, {
       hasUI: true,
-      sessionManager: { getEntries: () => [] },
+      sessionManager: { getEntries: () => [], getBranch: () => [] },
       ui: { notify() {} },
     });
     const value = pngImage();
-    await handlers.get("tool_result")?.({
+    const firstResult = await handlers.get("tool_result")?.({
       toolName: "read",
       toolCallId: "call-1",
       input: { path: "/tmp/input.png" },
-      content: [value],
+      content: [{ type: "text", text: "Read image" }, value],
     });
-    const contextEvent = {
+    expect(firstResult).toBeUndefined();
+
+    const freshContext = {
       messages: messages(
         assistant([{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "/tmp/input.png" } }]),
         toolResult("call-1", [value]),
-        assistant(),
       ),
     };
-    const transformed = await handlers.get("context")?.(contextEvent);
+    const transformed = await handlers.get("context")?.(freshContext);
+    expect((transformed.messages[1] as any).content[0]).toEqual(value);
+    await handlers.get("turn_end")?.({ message: assistant() });
 
-    expect(cacheStats(dir).images).toBe(1);
-    expect((transformed.messages[1] as any).content[0].text).toContain("Original source: /tmp/input.png");
+    const duplicateResult = await handlers.get("tool_result")?.({
+      toolName: "read",
+      toolCallId: "call-2",
+      input: { path: "/tmp/input.png" },
+      content: [{ type: "text", text: "Read image" }, value],
+    });
+    expect(duplicateResult.content[0]).toEqual({ type: "text", text: "Read image" });
+    expect(duplicateResult.content[1].type).toBe("text");
+    expect(duplicateResult.content[1].text).toContain("Image cache hit — payload not resent");
+    expect(duplicateResult.content.some((block: any) => block.type === "image")).toBe(false);
+
+    const changedImageResult = await handlers.get("tool_result")?.({
+      toolName: "read",
+      toolCallId: "call-3",
+      input: { path: "/tmp/input.png" },
+      content: [image("changed contents")],
+    });
+    expect(changedImageResult).toBeUndefined();
+
+    const cachedPath = path.join(dir, `${hashImage(value)}.png`);
+    const forcedResult = await handlers.get("tool_result")?.({
+      toolName: "read",
+      toolCallId: "call-4",
+      input: { path: cachedPath },
+      content: [value],
+    });
+    expect(forcedResult).toBeUndefined();
+    expect(await handlers.get("tool_result")?.({
+      toolName: "read",
+      toolCallId: "call-5",
+      input: { path: "/tmp/file.txt" },
+      content: [{ type: "text", text: "plain text" }],
+    })).toBeUndefined();
+
+    expect(cacheStats(dir).images).toBe(2);
     expect(entries).toHaveLength(0);
-    await handlers.get("turn_end")?.({});
+    await handlers.get("turn_end")?.({ message: assistant() });
     expect(entries).toHaveLength(1);
     expect(entries[0]!.data.sha256).toBe(hashImage(value));
     expect(JSON.stringify(entries[0]!.data)).not.toContain(value.data);
-
-    await handlers.get("context")?.(contextEvent);
-    await handlers.get("turn_end")?.({});
-    expect(entries).toHaveLength(1);
     expect(commands.has("image-cache")).toBe(true);
 
     const renderer = renderers.get(entries[0]!.customType)!;
@@ -376,6 +422,42 @@ describe("image cache", () => {
     expect(missingPreview.render(120).join("\n")).toContain("Cached preview is unavailable");
   });
 
+  test("restores seen SHA state from successful session history after reload", async () => {
+    const dir = tempDir();
+    process.env.PI_IMAGE_CONTEXT_CACHE_DIR = dir;
+    const handlers = new Map<string, (event: any, ctx?: any) => Promise<any>>();
+    const value = pngImage();
+    imageContextCacheExtension({
+      on(name: string, handler: (event: any, ctx?: any) => Promise<any>) {
+        handlers.set(name, handler);
+      },
+      registerCommand() {},
+      registerEntryRenderer() {},
+      appendEntry() {},
+    } as any);
+
+    await handlers.get("session_start")?.({}, {
+      hasUI: true,
+      sessionManager: {
+        getEntries: () => [],
+        getBranch: () => [
+          { type: "message", message: assistant([{ type: "toolCall", id: "old", name: "read", arguments: { path: "/tmp/a.png" } }]) },
+          { type: "message", message: toolResult("old", [value]) },
+          { type: "message", message: assistant() },
+        ],
+      },
+      ui: { notify() {} },
+    });
+    const duplicate = await handlers.get("tool_result")?.({
+      toolName: "read",
+      toolCallId: "new",
+      input: { path: "/tmp/a.png" },
+      content: [value],
+    });
+
+    expect(duplicate.content[0].text).toContain("Image cache hit");
+  });
+
   test("restores rendered SHA deduplication from persisted custom entries", async () => {
     const dir = tempDir();
     process.env.PI_IMAGE_CONTEXT_CACHE_DIR = dir;
@@ -398,12 +480,19 @@ describe("image cache", () => {
       hasUI: true,
       sessionManager: {
         getEntries: () => [{ type: "custom", customType: "pi-image-context-cache-hit", data: { ...record, timestamp: 1 } }],
+        getBranch: () => [],
       },
       ui: { notify() {} },
     });
-    await handlers.get("context")?.({ messages: messages(user([value]), assistant()) });
-    await handlers.get("turn_end")?.({});
+    const duplicate = await handlers.get("tool_result")?.({
+      toolName: "read",
+      toolCallId: "call-restored",
+      input: { path: "/tmp/input.png" },
+      content: [value],
+    });
+    await handlers.get("turn_end")?.({ message: assistant() });
 
+    expect(duplicate.content[0].text).toContain("Image cache hit");
     expect(appended).toHaveLength(0);
   });
 });

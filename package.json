@@ -1,6 +1,6 @@
 {
   "name": "@yusukeshib/pi-image-context-cache",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Cache images from pi sessions and evict stale image payloads from repeated LLM context.",
   "keywords": [
     "pi-package",
